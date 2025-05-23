@@ -189,6 +189,27 @@ class HTTPSession(BaseSession):
 ThreadQueue = Deque[tuple[Callable, object, tuple, Dict]]
 
 
+class McpSession:
+
+    def __init__(
+            self,
+            name: str,
+            client: "ClientSession",
+            task: asyncio.Task,
+            stop_event: asyncio.Event):
+        self.name = name
+        self.client = client
+        self.task = task
+        self.stop_event = stop_event
+
+    async def close(self) -> None:
+        logger.info(f"Sending stop event to {self.name}")
+        self.stop_event.set()
+        logger.info(f"Waiting for task {self.name} to finish")
+        await self.task
+        logger.info(f"Task {self.name} finished")
+
+
 class WebsocketSession(BaseSession):
     """Internal web socket session object.
 
@@ -203,7 +224,7 @@ class WebsocketSession(BaseSession):
 
     to_clear: bool = False
 
-    mcp_sessions: dict[str, tuple["ClientSession", AsyncExitStack]]
+    mcp_sessions: dict[str, McpSession]
 
     def __init__(
         self,

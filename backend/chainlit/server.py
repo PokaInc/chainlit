@@ -1085,26 +1085,140 @@ async def call_action(
     return JSONResponse(content={"success": True, "response": response})
 
 
+
+async def connect_to_mcp_server(connection_name: str, sse_endpoint: str,
+                                sessionId:str) -> None:
+
+    ready_event = asyncio.Event()
+
+    async def mcp_session_runner() -> None:
+        from chainlit.mcp import SseMcpConnection
+        from chainlit.session import WebsocketSession, McpSession
+        from mcp import ClientSession
+        from mcp.client.sse import sse_client
+
+        session = WebsocketSession.get_by_id(sessionId)
+        if not session:
+            logger.error(f"invalid session id {sessionId}")
+            raise HTTPException(
+                status_code = 400,
+                detail=f"Invalid session id {sessionId}"
+            )
+
+        # If the connection already exists, close it
+        if connection_name in session.mcp_sessions:
+            old_mcp_session = session.mcp_sessions[connection_name]
+            if on_mcp_disconnect := config.code.on_mcp_disconnect:
+                await on_mcp_disconnect(connection_name, old_mcp_session.client)
+            try:
+                await old_mcp_session.close() # <===
+            except Exception as e:
+                logger.exception(e)
+                pass
+
+        # Create a new MCP connection
+        try:
+            exit_stack = AsyncExitStack()
+            mcp_connection = SseMcpConnection(
+                url=sse_endpoint, name=connection_name
+            )  # type: SseMcpConnection
+
+            transport = await exit_stack.enter_async_context(
+                sse_client(
+                    url=mcp_connection.url,
+                )
+            )
+            read, write = transport
+            mcp_client: ClientSession = await exit_stack.enter_async_context(
+                ClientSession(
+                    read_stream=read, write_stream=write, sampling_callback=None
+                )
+            )
+
+            # Initialize the session
+            await mcp_client.initialize()
+
+        except Exception as e:
+            logger.exception(
+                "Something went wrong during MCP connection",
+                exc_info=e,
+            )
+            raise ConnectionError(
+                f"Failed to connect to MCP server at {sse_endpoint}: {e}"
+            ) from e
+
+        finally:
+            logger.info("Sending MCP connection ready event")
+            ready_event.set() # <===
+
+        try:
+            stop_event = asyncio.Event()
+
+            # Store the session
+            current_task = asyncio.current_task()
+            assert current_task is not None, "Current task should not be None"
+
+            session.mcp_sessions[mcp_connection.name] = McpSession(
+                name=mcp_connection.name,
+                client=mcp_client,
+                task=current_task,
+                stop_event=stop_event,
+            ) # <===
+
+            # Call the callback
+            await config.code.on_mcp_connect(mcp_connection, mcp_client)
+
+            # Wait for the stop event
+            await stop_event.wait() # <===
+
+        except asyncio.CancelledError:
+            logger.info(f"MCP session {connection_name} cancelled")
+            raise
+
+        except Exception as e:
+            logger.exception(
+                "Something went wrong during MCP connection",
+                exc_info=e,
+            )
+            raise
+
+        finally:
+            logger.info(f"Closing MCP session {connection_name}")
+            try:
+                await exit_stack.aclose() # <===
+
+            except Exception as e:
+                logger.exception("Error during exit stack close", exc_info=e)
+                pass
+
+            logger.info(f"MCP session {connection_name} closed")
+
+    # Run the session runner in a separate task
+    asyncio.create_task(mcp_session_runner())
+    logger.info(f"Waiting for MCP connection {connection_name} to be ready")
+    await ready_event.wait()
+    logger.info(f"MCP connection {connection_name} is ready")
+
+
+
 @router.post("/mcp")
 async def connect_mcp(
     payload: ConnectMCPRequest,
     current_user: UserParam,
 ):
-    from mcp import ClientSession
-    from mcp.client.sse import sse_client
-    from mcp.client.stdio import (
-        StdioServerParameters,
-        get_default_environment,
-        stdio_client,
-    )
 
     from chainlit.context import init_ws_context
-    from chainlit.mcp import SseMcpConnection, StdioMcpConnection, validate_mcp_command
     from chainlit.session import WebsocketSession
 
     session = WebsocketSession.get_by_id(payload.sessionId)
-    context = init_ws_context(session)
+    if not session:
+        logger.error(f"invalid session id {payload.sessionId}")
+        raise HTTPException(
+            status_code = 400,
+            detail=f"Invalid session id {payload.sessionId}"
+        )
 
+    context = init_ws_context(session)
     if current_user:
         if (
             not context.session.user
@@ -1115,85 +1229,36 @@ async def connect_mcp(
             )
 
     mcp_enabled = config.code.on_mcp_connect is not None
-    if mcp_enabled:
-        if payload.name in session.mcp_sessions:
-            old_client_session, old_exit_stack = session.mcp_sessions[payload.name]
-            if on_mcp_disconnect := config.code.on_mcp_disconnect:
-                await on_mcp_disconnect(payload.name, old_client_session)
-            try:
-                await old_exit_stack.aclose()
-            except Exception:
-                pass
 
-        try:
-            exit_stack = AsyncExitStack()
-
-            if payload.clientType == "sse":
-                if not config.features.mcp.sse.enabled:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="SSE MCP is not enabled",
-                    )
-
-                mcp_connection = SseMcpConnection(url=payload.url, name=payload.name)  # type: SseMcpConnection
-
-                transport = await exit_stack.enter_async_context(
-                    sse_client(url=mcp_connection.url)
-                )
-            elif payload.clientType == "stdio":
-                if not config.features.mcp.stdio.enabled:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Stdio MCP is not enabled",
-                    )
-
-                env_from_cmd, command, args = validate_mcp_command(payload.fullCommand)
-                mcp_connection = StdioMcpConnection(  # type: ignore[no-redef]
-                    command=command, args=args, name=payload.name
-                )  # type: StdioMcpConnection
-
-                env = get_default_environment()
-                env.update(env_from_cmd)
-                # Create the server parameters
-                server_params = StdioServerParameters(
-                    command=command,
-                    args=args,
-                    env=env,
-                )
-
-                transport = await exit_stack.enter_async_context(
-                    stdio_client(server_params)
-                )
-
-            read, write = transport
-
-            mcp_session: ClientSession = await exit_stack.enter_async_context(
-                ClientSession(
-                    read_stream=read, write_stream=write, sampling_callback=None
-                )
-            )
-
-            # Initialize the session
-            await mcp_session.initialize()
-
-            # Store the session
-            session.mcp_sessions[mcp_connection.name] = (mcp_session, exit_stack)
-
-            # Call the callback
-            await config.code.on_mcp_connect(mcp_connection, mcp_session)
-
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Could not connect to the MCP: {e!s}",
-            )
-    else:
+    if not mcp_enabled:
         raise HTTPException(
             status_code=400,
             detail="This app does not support MCP.",
         )
 
-    tool_list = await mcp_session.list_tools()
+    if payload.clientType == "stdio":
+        raise HTTPException(
+            status_code=400,
+            detail="Stdio MCP is not enabled (in this modified version)",
+        )
+
+    if payload.clientType == "sse":
+        if not config.features.mcp.sse.enabled:
+            raise HTTPException(
+                status_code=400,
+                detail="SSE MCP is not enabled",
+            )
+
+    try:
+        await connect_to_mcp_server(payload.name, payload.url, payload.sessionId)
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not connect to the MCP: {e!s}",
+        )
+
+    tool_list = await session.mcp_sessions[payload.name].client.list_tools()
 
     return JSONResponse(
         content={
@@ -1220,6 +1285,13 @@ async def disconnect_mcp(
     from chainlit.session import WebsocketSession
 
     session = WebsocketSession.get_by_id(payload.sessionId)
+    if not session:
+        logger.error(f"invalid session id {payload.sessionId}")
+        raise HTTPException(
+            status_code = 400,
+            detail=f"Invalid session id {payload.sessionId}"
+        )
+
     context = init_ws_context(session)
 
     if current_user:
@@ -1234,15 +1306,11 @@ async def disconnect_mcp(
     callback = config.code.on_mcp_disconnect
     if payload.name in session.mcp_sessions:
         try:
-            client_session, exit_stack = session.mcp_sessions[payload.name]
+            mcp_session = session.mcp_sessions[payload.name]
             if callback:
-                await callback(payload.name, client_session)
+                await callback(payload.name, mcp_session.client)
 
-            try:
-                await exit_stack.aclose()
-            except Exception:
-                pass
-            del session.mcp_sessions[payload.name]
+            await mcp_session.close()
 
         except Exception as e:
             raise HTTPException(
