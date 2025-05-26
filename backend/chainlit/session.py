@@ -287,10 +287,11 @@ class WebsocketSession(BaseSession):
         ws_sessions_sid.pop(self.socket_id, None)
         ws_sessions_id.pop(self.id, None)
 
-        for _, exit_stack in self.mcp_sessions.values():
+        for mcp_session in self.mcp_sessions.values():
             try:
-                await exit_stack.aclose()
+                await mcp_session.close()
             except Exception:
+                logger.error(f"WebsocketSession: mcp_session.close() Error: {e}")
                 pass
 
     async def flush_method_queue(self):
